@@ -9,9 +9,11 @@
 //! module. The rest of it is available to make sure consumers of the API can understand precisely
 //! what types come out of functions that return `CursorIter`.
 
-use futures::Stream;
+use hyper::{Body, Request};
+use futures::{FutureExt, Stream};
 use serde::{de::DeserializeOwned, Deserialize};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -367,5 +369,76 @@ where
 
         self.loader = Some(Box::pin(self.call()));
         self.poll_next(cx)
+    }
+}
+
+pub trait ActivityCursor: DeserializeOwned {
+    type Item;
+
+    fn next_cursor(&self) -> Option<String>;
+
+    fn into_inner(self) -> Vec<Self::Item>;
+}
+
+pub struct ActivityCursorIter<Cursor: ActivityCursor + Sized> {
+    url: &'static str,
+    token: auth::Token,
+    pub next_cursor: Option<String>,
+    pub count: u32,
+    pub loaded: bool,
+    _marker: PhantomData<Cursor>,
+}
+
+impl<Cursor: ActivityCursor + Sized> ActivityCursorIter<Cursor> {
+    pub(crate) fn new(url: &'static str, token: &auth::Token) -> Self {
+        ActivityCursorIter {
+            url,
+            token: token.clone(),
+            next_cursor: None,
+            count: 20,
+            loaded: false,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn with_page_size(self, count: u32) -> Self {
+        ActivityCursorIter {
+            count,
+            next_cursor: None,
+            loaded: false,
+            ..self
+        }
+    }
+
+    /// Clears the saved cursor information on this `ActivityCursorIter`.
+    pub fn reset(&mut self) {
+        self.next_cursor = None;
+        self.loaded = false;
+    }
+
+    fn request(&self, cursor: Option<String>) -> Request<Body> {
+        let params = ParamList::new()
+            .add_param("count", self.count.to_string())
+            .add_opt_param("cursor", cursor);
+
+        get(self.url, &self.token, Some(&params))
+    }
+
+    /// Loads the next page of messages, setting the `next_cursor` to the one received from
+    /// Twitter.
+    pub fn next_page<'s>(&'s mut self)
+        -> impl Future<Output = Result<Response<Vec<Cursor::Item>>>> + 's
+    {
+        let next_cursor = self.next_cursor.take();
+        let req = self.request(next_cursor);
+        let loader = request_with_json_response(req);
+        loader.map(
+            move |resp: Result<Response<Cursor>>| {
+                let resp = resp?;
+                self.loaded = true;
+                self.next_cursor = resp.next_cursor();
+                Ok(Response::map(resp, |c| c.into_inner()))
+            }
+        )
     }
 }
